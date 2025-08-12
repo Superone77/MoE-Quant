@@ -1,7 +1,7 @@
 ## MoE-Quant
 ---
 
-This repository provides code for [GPTQ](https://arxiv.org/abs/2210.17323) quantization of [DeepSeekV3](https://huggingface.co/deepseek-ai/DeepSeek-V3)/[DeepSeekR1](https://huggingface.co/deepseek-ai/DeepSeek-R1) model family.
+This repository provides code for [GPTQ](https://arxiv.org/abs/2210.17323) quantization of [DeepSeekV3](https://huggingface.co/deepseek-ai/DeepSeek-V3)/[DeepSeekR1](https://huggingface.co/deepseek-ai/DeepSeek-R1) and OLMoE model families.
 
 ### News 🔥
 
@@ -20,7 +20,7 @@ Since one has to quantize a lot (really a lot - ~45k) of linear layers, a faster
 
 Currently we support conversion of `GPTQ`-quantized model into the [compressed_tensors](https://github.com/neuralmagic/compressed-tensors) format supported in HuggingFace transformers and vLLM. 
 
-At the moment only 4-bit symmetric quantization with different quantization group sizes is supported.
+At the moment only 4-bit symmetric quantization with different quantization group sizes is supported, including both `int4` and `nvfp4` formats.
 We plan to implement other bit widths and quantization formats (`AWQ`, `AutoGPQ`) in the future. 
 
 

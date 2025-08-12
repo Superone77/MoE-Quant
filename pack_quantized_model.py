@@ -79,6 +79,7 @@ def prepare_quantization_config(args: argparse.Namespace) -> dict[str, Any]:
     ignored_modules = ["lm_head"]
     if args.quantize_only_experts:
         ignored_modules += ["re:.*self_attn.*", "re:.*shared_experts.*", "re:.*mlp\.(gate|up|gate_up|down)_proj.*"]
+    weight_type = "int" if args.quant_format == "int4" else args.quant_format
     return {
         "config_groups": {
             "group_0": {
@@ -97,7 +98,7 @@ def prepare_quantization_config(args: argparse.Namespace) -> dict[str, Any]:
                     "observer_kwargs": {},
                     "strategy": "group",
                     "symmetric": True,
-                    "type": "int"
+                    "type": weight_type
                 }
             }
         },
@@ -134,6 +135,7 @@ def main():
     args.bits = metadata["bits"]
     args.group_size = metadata["group_size"]
     args.quantize_only_experts = metadata["quantize_only_experts"]
+    args.quant_format = metadata.get("quant_format", "int4")
     # Currently we do not support asymmetric quantization
     args.sym = True
 

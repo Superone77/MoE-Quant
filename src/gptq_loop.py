@@ -2,7 +2,7 @@ import torch
 import triton
 from triton import language as tl
 
-from src.quant_utils import tl_quantize, tl_dequantize
+from src.quant_utils import tl_quantize, tl_dequantize, nvfp4_quantize
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -65,6 +65,18 @@ def quantize_error_triton(
     )
 
 
+def quantize_error_nvfp4(
+    x: torch.Tensor,
+    qx: torch.Tensor,
+    error: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    q, y = nvfp4_quantize(x, scale)
+    qx.copy_(q)
+    error.copy_(y - x)
+    x.copy_(y)
+
+
 @triton.jit
 def addvv_triton_kernel(
     vec_a_ptr,
@@ -116,6 +128,7 @@ def gptq_loop_graph(
     dtype: torch.dtype = None,
     gptq_block_size: int = 128,
     direct: bool = True,
+    quant_format: str = "int4",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     CUDA Graph wrapper for GPTQ loops
@@ -169,10 +182,10 @@ def gptq_loop_graph(
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(n_warmups):
-                gptq_loop_graph(**graph_tensors, dtype=dtype, gptq_block_size=gptq_block_size, direct=True)
+                gptq_loop_graph(**graph_tensors, dtype=dtype, gptq_block_size=gptq_block_size, direct=True, quant_format=quant_format)
         torch.cuda.current_stream().wait_stream(s)
         with torch.cuda.graph(graph):
-            gptq_loop_graph(**graph_tensors, dtype=dtype, gptq_block_size=gptq_block_size, direct=True)
+            gptq_loop_graph(**graph_tensors, dtype=dtype, gptq_block_size=gptq_block_size, direct=True, quant_format=quant_format)
         gptq_loop_graph.graph_info[graph_key] = {"graph": graph, "tensors": graph_tensors}
 
     graph, graph_tensors = (
@@ -198,6 +211,7 @@ def gptq_loop(
     maxq: torch.Tensor,
     dtype: torch.dtype,
     gptq_block_size: int = 128,
+    quant_format: str = "int4",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize weight tensor with GPTQ algorithm
@@ -212,6 +226,18 @@ def gptq_loop(
     if gptq_block_size <= 0:
         gptq_block_size = weight.size(-2)
 
+    if quant_format == "nvfp4":
+        n_columns, n_rows = weight.shape
+        qweight = torch.empty_like(weight, dtype=torch.uint8)
+        error_block = torch.empty(gptq_block_size, n_rows, dtype=weight.dtype, device=weight.device)
+        for i1 in range(0, n_columns, gptq_block_size):
+            i2 = min(i1 + gptq_block_size, n_columns)
+            for j in range(i1, i2):
+                quantize_error_nvfp4(weight[j], qweight[j], error_block[j - i1], scale[j])
+                addvv_triton(hessian_inv[j, j + 1 : i2], error_block[j - i1], weight[j + 1 : i2])
+            weight[i2:].addmm_(hessian_inv[i1:i2, i2:].t(), error_block[: i2 - i1], beta=1, alpha=1)
+        return qweight
+
     qweight, _ = gptq_loop_graph(
         weight=weight,
         hessian_inv=hessian_inv,
@@ -221,5 +247,6 @@ def gptq_loop(
         dtype=dtype,
         gptq_block_size=gptq_block_size,
         direct=False,
+        quant_format=quant_format,
     )
-    return qweight # (C, R)
+    return qweight
