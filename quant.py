@@ -19,7 +19,8 @@ except:
 from src import dist_utils, data_utils, model_utils, quant_utils, loading_utils, gptq
 
 
-ROUTED_EXPERTS_REGEX = ".*mlp.experts.\d+.(down|gate|up)_proj$"
+DEFAULT_ROUTED_EXPERTS_REGEX = ".*mlp.experts.\d+.(down|gate|up)_proj$"
+OLMOE_ROUTED_EXPERTS_REGEX = ".*experts.\d+.(down|up)_proj$"
 TIED_FFN_GROUPS = ("gate_proj", "up_proj")
 
 
@@ -60,6 +61,11 @@ def parse_args():
     parser.add_argument("--block_size", type=int, default=128)
     parser.add_argument("--quantization_scale", type=str, default="absmax", choices=["absmax", "mse"])
     parser.add_argument("--quantization_order", type=str, default="default", choices=["default", "activation"])
+    parser.add_argument(
+        "--nvfp4",
+        action="store_true",
+        help="Use NVFP4 weight format instead of integer quantization.",
+    )
     parser.add_argument(
         "--quantize_only_experts",
         default=False,
@@ -115,13 +121,17 @@ def main():
         assert wandb_enabled, "wandb not installed. try `pip install wandb`"
         wandb.init(config=args)
 
-    # Load DeepSeek model
+    # Load model configuration
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-    # Sanity check
-    assert config.architectures == ["DeepseekV3ForCausalLM"], "Only DeepseekV3 is supported!"
+    arch = config.architectures[0]
+    assert arch in ["DeepseekV3ForCausalLM", "OLMoEForCausalLM"], "Only DeepseekV3 or OLMoE are supported!"
     if hasattr(config, "quantization_config"):
         delattr(config, "quantization_config")
     config.ep_size = world_size
+
+    routed_experts_regex = DEFAULT_ROUTED_EXPERTS_REGEX
+    if arch == "OLMoEForCausalLM":
+        routed_experts_regex = OLMOE_ROUTED_EXPERTS_REGEX
 
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(
@@ -252,14 +262,14 @@ def main():
 
                     return _hook
 
-                if args.quantize_only_experts and re.search(ROUTED_EXPERTS_REGEX, layer_name) is None:
+                if args.quantize_only_experts and re.search(routed_experts_regex, layer_name) is None:
                     continue
 
                 tied_gptq_handle = None
                 if args.tie_gptq_handles and layer_name.endswith("up_proj"):
                     parent_name, _ = layer_name.rsplit(".", 1)
                     tied_layer_name = f"{parent_name}.gate_proj"
-                    tied_gptq_handle = handles[tied_layer_name]
+                    tied_gptq_handle = handles.get(tied_layer_name)
 
                 handles[layer_name] = gptq.GPTQ(
                     layer,
@@ -269,7 +279,7 @@ def main():
                     args.block_size,
                     args.quantization_order,
                     args.quantization_scale,
-                    is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None,
+                    is_distributed=re.search(routed_experts_regex, layer_name) is None,
                     tied_gptq_handle=tied_gptq_handle
                 )    
 
@@ -285,7 +295,7 @@ def main():
 
             dist_utils.barrier(device_ids=[rank])
 
-            shared_handles = {k: v for k, v in handles.items() if re.search(ROUTED_EXPERTS_REGEX, k) is None}
+            shared_handles = {k: v for k, v in handles.items() if re.search(routed_experts_regex, k) is None}
             expert_handles = {k: v for k, v in handles.items() if k not in shared_handles}
 
             # Quantized shared handles first
@@ -296,7 +306,10 @@ def main():
                 dist_utils.print_on_main(f"Quantizing layer {handle_name}")
                 qweight, scale, zero = handle.quantize(args.bits)
                 # Construct dequantized weight
-                dequantized_weight = quant_utils.dequantize_linear_weight(qweight, scale, zero)
+                if args.nvfp4:
+                    dequantized_weight = quant_utils.dequantize_nvfp4_weight(qweight, scale, zero)
+                else:
+                    dequantized_weight = quant_utils.dequantize_linear_weight(qweight, scale, zero)
                 assert (
                     torch.isfinite(dequantized_weight).all().item()
                 ), f"[rank{rank}] {handle_name} weight is broken after quantization."
@@ -352,7 +365,10 @@ def main():
                     rank_expert_message += f"Quantizing layer {handle_name}\n"
                     qweight, scale, zero = handle.quantize(args.bits)
                     # Construct dequantized weight
-                    dequantized_weight = quant_utils.dequantize_linear_weight(qweight, scale, zero)
+                    if args.nvfp4:
+                        dequantized_weight = quant_utils.dequantize_nvfp4_weight(qweight, scale, zero)
+                    else:
+                        dequantized_weight = quant_utils.dequantize_linear_weight(qweight, scale, zero)
                     assert (
                         torch.isfinite(dequantized_weight).all().item()
                     ), f"[rank{rank}] {handle_name} weight is broken after quantization."
