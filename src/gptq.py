@@ -31,7 +31,8 @@ class GPTQ:
         quantization_order: str = "default",
         quantization_scale: str = "absmax",
         is_distributed: bool = False,
-        tied_gptq_handle: Optional["GPTQ"] = None
+        tied_gptq_handle: Optional["GPTQ"] = None,
+        quant_format: str = "int4",
     ):
         self._validate_layer(layer)
         self.layer = layer
@@ -45,6 +46,7 @@ class GPTQ:
         self.block_size = block_size or self.d_col
         self.quantization_order = QuantizationOrder(quantization_order)
         self.quantization_scale = quantization_scale
+        self.quant_format = quant_format
         # backup layer properties
         self.W_device = self.W.device
         self.W_dtype = self.W.dtype
@@ -175,6 +177,7 @@ class GPTQ:
                 symmetric=self.sym,
                 dtype=dtype,
                 quantization_scale=self.quantization_scale,
+                quant_format=self.quant_format,
             )
             # Get permutation
             if self.quantization_order == QuantizationOrder.ACTIVATION:
@@ -189,13 +192,14 @@ class GPTQ:
             hessian_inv = self._get_hessian_inverse()
             # Quantize
             qweight = gptq_loop.gptq_loop(
-                weight=self.W.transpose(-2, -1)[perm],  
+                weight=self.W.transpose(-2, -1)[perm],
                 hessian_inv=hessian_inv,
-                scale=scale.transpose(-2, -1)[perm], 
-                qzero=zero.transpose(-2, -1)[perm],  
-                maxq=maxq, 
+                scale=scale.transpose(-2, -1)[perm],
+                qzero=zero.transpose(-2, -1)[perm],
+                maxq=maxq,
                 dtype=dtype,
                 gptq_block_size=block_size,
+                quant_format=self.quant_format,
             )[perm_inv].transpose(-2, -1).contiguous().to(torch.uint8)
             # Remove scale and zero replication  
             scale = scale[:, ::group_size].to(dtype)

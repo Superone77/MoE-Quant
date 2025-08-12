@@ -61,6 +61,13 @@ def parse_args():
     parser.add_argument("--quantization_scale", type=str, default="absmax", choices=["absmax", "mse"])
     parser.add_argument("--quantization_order", type=str, default="default", choices=["default", "activation"])
     parser.add_argument(
+        "--quant_format",
+        type=str,
+        default="int4",
+        choices=["int4", "nvfp4"],
+        help="Weight quantization format",
+    )
+    parser.add_argument(
         "--quantize_only_experts",
         default=False,
         action="store_true",
@@ -115,10 +122,10 @@ def main():
         assert wandb_enabled, "wandb not installed. try `pip install wandb`"
         wandb.init(config=args)
 
-    # Load DeepSeek model
+    # Load model
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-    # Sanity check
-    assert config.architectures == ["DeepseekV3ForCausalLM"], "Only DeepseekV3 is supported!"
+    if config.architectures[0] not in ["DeepseekV3ForCausalLM", "OLMoEForCausalLM"]:
+        raise ValueError("Only DeepseekV3 and OLMoE models are supported!")
     if hasattr(config, "quantization_config"):
         delattr(config, "quantization_config")
     config.ep_size = world_size
@@ -270,8 +277,9 @@ def main():
                     args.quantization_order,
                     args.quantization_scale,
                     is_distributed=re.search(ROUTED_EXPERTS_REGEX, layer_name) is None,
-                    tied_gptq_handle=tied_gptq_handle
-                )    
+                    tied_gptq_handle=tied_gptq_handle,
+                    quant_format=args.quant_format,
+                )
 
                 if tied_gptq_handle is None:
                     hooks[layer_name] = layer.register_forward_hook(update_handle_hook(layer_name))
@@ -296,7 +304,9 @@ def main():
                 dist_utils.print_on_main(f"Quantizing layer {handle_name}")
                 qweight, scale, zero = handle.quantize(args.bits)
                 # Construct dequantized weight
-                dequantized_weight = quant_utils.dequantize_linear_weight(qweight, scale, zero)
+                dequantized_weight = quant_utils.dequantize_linear_weight(
+                    qweight, scale, zero, quant_format=args.quant_format
+                )
                 assert (
                     torch.isfinite(dequantized_weight).all().item()
                 ), f"[rank{rank}] {handle_name} weight is broken after quantization."
@@ -321,9 +331,9 @@ def main():
                 if args.save_dir and dist_utils.is_main():
                     os.makedirs(os.path.join(args.save_dir, handle_name), exist_ok=True)
                     torch.save(
-                        {"qweight": qweight, "scale": scale, "zero": zero},
-                        os.path.join(args.save_dir, handle_name, f"quantized_weight.pt"),
-                    )
+            {"qweight": qweight, "scale": scale, "zero": zero},
+            os.path.join(args.save_dir, handle_name, f"quantized_weight.pt"),
+        )
                 # Replace original weight by quantized one
                 handle.layer.weight.data = dequantized_weight
                 # Destroy handle
@@ -429,7 +439,8 @@ def main():
             {
                 "bits": args.bits,
                 "group_size": args.group_size,
-                "quantize_only_experts": args.quantize_only_experts
+                "quantize_only_experts": args.quantize_only_experts,
+                "quant_format": args.quant_format,
             },
             os.path.join(args.save_dir, "metadata.pt")
         )

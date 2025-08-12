@@ -16,6 +16,34 @@ torch.set_float32_matmul_precision("highest")
 FP8_GROUP_SIZE = 128
 FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2, torch.float8_e5m2fnuz)
 
+# NVidia FP4 lookup table
+def _nvfp4_table(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    q = torch.arange(16, device=device, dtype=torch.int16)
+    sign = 1 - 2 * ((q >> 3) & 1).float()
+    exp = ((q >> 1) & 0x3).float() - 1
+    mant = (q & 0x1).float()
+    table = sign * (1.0 + 0.5 * mant) * torch.pow(2.0, exp)
+    table[(q & 0x7) == 0] = 0.0
+    return table.to(dtype=dtype)
+
+
+def nvfp4_quantize(x: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    table = _nvfp4_table(x.device, x.dtype)
+    x_scaled = x / scale
+    diff = (x_scaled.unsqueeze(-1) - table).abs()
+    q = diff.argmin(dim=-1).to(torch.uint8)
+    y = scale * table[q.long()]
+    return q, y
+
+
+def find_nvfp4_scale(x: torch.Tensor, dtype: torch.dtype = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    table = _nvfp4_table(x.device, x.dtype)
+    max_val = table.abs().max().item()
+    scale = round_fp(x.abs().amax(dim=-1) / max_val + 1e-12, dtype)
+    zero = torch.zeros_like(scale)
+    maxq = torch.tensor(15, dtype=x.dtype, device=x.device)
+    return scale, zero, maxq
+
 
 class QuantizationScale(Enum):
     ABSMAX = "absmax"
@@ -203,6 +231,7 @@ def get_quantization_grid(
     quant_max_shrink: float = 0.2,
     quant_n_grid: int = 100,
     quant_norm: float = 2.4,
+    quant_format: str = "int4",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Get the quantization grid for the weight matrix
@@ -212,6 +241,13 @@ def get_quantization_grid(
     maxq: ()
     """
     weight = weight.unflatten(dim=-1, sizes=(-1, group_size))  # (..., G, gs)
+
+    if quant_format == "nvfp4":
+        scale, qzero, maxq = find_nvfp4_scale(weight, dtype)
+        scale = scale.repeat_interleave(group_size, dim=-1)
+        qzero = qzero.repeat_interleave(group_size, dim=-1)
+        weight = weight.flatten(start_dim=-2)
+        return scale, qzero, maxq
 
     scale, qzero, maxq = find_quantization_meta(
         x=weight,
@@ -245,11 +281,17 @@ def dequantize_linear_weight(
     scale: torch.Tensor,
     zero: torch.Tensor,
     perm: Optional[torch.Tensor] = None,
+    quant_format: str = "int4",
 ):
     scale = scale.view(qweight.shape[0], -1, 1)
     zero = zero.view(qweight.shape[0], -1, 1)
     num_groups = scale.shape[1]
-    weight = dequantize(qweight.view(qweight.shape[0], num_groups, -1), scale, zero).view_as(qweight)
+    if quant_format == "nvfp4":
+        table = _nvfp4_table(qweight.device, scale.dtype)
+        weight = table[qweight.long()].view(qweight.shape[0], num_groups, -1) * scale
+        weight = weight.view_as(qweight)
+    else:
+        weight = dequantize(qweight.view(qweight.shape[0], num_groups, -1), scale, zero).view_as(qweight)
     if perm is not None:
         invperm = perm.argsort()
         weight = weight[:, invperm]
