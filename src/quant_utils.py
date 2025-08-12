@@ -256,6 +256,21 @@ def dequantize_linear_weight(
     return weight
 
 
+def dequantize_nvfp4_weight(
+    qweight: torch.Tensor,
+    scale: torch.Tensor,
+    zero: torch.Tensor,
+    perm: Optional[torch.Tensor] = None,
+):
+    """Dequantize weights stored in NVFP4 format.
+
+    NVFP4 uses the same linear dequantization as integer 4-bit weights, so we
+    reuse :func:`dequantize_linear_weight` for actual computation.  This helper
+    function provides a dedicated entry point for NVFP4 formatted tensors.
+    """
+    return dequantize_linear_weight(qweight, scale, zero, perm)
+
+
 def get_relative_mse_error(q: torch.Tensor, w: torch.Tensor, H: Optional[torch.Tensor] = None):
     delta = q - w
     if H is None:
